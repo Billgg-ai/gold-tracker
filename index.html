@@ -4,6 +4,9 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>伦敦金主连金价跟踪工具</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
@@ -59,12 +62,19 @@
           <div class="two-col">
             <div class="panel">
               <div class="panel-title">
-                <h2>20日隐含波动率与GVZ</h2>
-                <span>近20个交易日</span>
+                <h2>20日已实现波动率</h2>
+                <span>年化 · 近三年</span>
               </div>
-              <canvas id="volChart" height="220"></canvas>
+              <canvas id="rvChart" height="220"></canvas>
             </div>
-        </div>
+            <div class="panel">
+              <div class="panel-title">
+                <h2>GVZ 隐含波动率指数</h2>
+                <span id="gvzSource">FRED GVZCLS · 与金价交易日对齐</span>
+              </div>
+              <canvas id="gvzChart" height="220"></canvas>
+            </div>
+          </div>
 
           <div class="panel">
             <div class="panel-title">

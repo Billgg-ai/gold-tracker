@@ -48,6 +48,17 @@ function formatPct(value, digits = 2) {
   return `${value > 0 ? "+" : ""}${formatNumber(value, digits)}%`;
 }
 
+function pctTone(value) {
+  if (!Number.isFinite(value) || value === 0) return "";
+  return value > 0 ? "up" : "down";
+}
+
+function formatPctHtml(value, digits = 2) {
+  const tone = pctTone(value);
+  const text = formatPct(value, digits);
+  return tone ? `<span class="${tone}">${text}</span>` : text;
+}
+
 function toDate(ts) {
   return new Date(ts * 1000).toISOString().slice(0, 10);
 }
@@ -120,7 +131,8 @@ async function fetchFredSeries(id) {
   return lines
     .map((line) => {
       const [date, raw] = line.split(",");
-      const value = raw === "." ? NaN : Number(raw);
+      const trimmed = raw?.trim();
+      const value = !trimmed || trimmed === "." ? NaN : Number(trimmed);
       return { date, value };
     })
     .filter((point) => Number.isFinite(point.value));
@@ -188,7 +200,124 @@ function latestTransformed(series, transform) {
   return { value: current.value, change: previous ? current.value - previous.value : NaN, date: current.date };
 }
 
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, Number.isFinite(value) ? value : 0));
+}
+
+function normalizeDateKey(date) {
+  return String(date).replace(/-/g, "").slice(0, 8);
+}
+
+function formatChartDate(date) {
+  const key = normalizeDateKey(date);
+  if (key.length >= 6) return `${key.slice(0, 4)}-${key.slice(4, 6)}`;
+  return String(date);
+}
+
+function alignSeriesByDates(referenceSeries, targetSeries) {
+  const sorted = [...targetSeries].sort(
+    (a, b) => normalizeDateKey(a.date).localeCompare(normalizeDateKey(b.date)),
+  );
+  const valueByDate = new Map(
+    sorted.map((point) => [normalizeDateKey(point.date), point.value]),
+  );
+  let lastValue = null;
+  const aligned = [];
+  referenceSeries.forEach((point) => {
+    const key = normalizeDateKey(point.date);
+    if (valueByDate.has(key)) lastValue = valueByDate.get(key);
+    if (Number.isFinite(lastValue)) aligned.push({ date: point.date, value: lastValue });
+  });
+  return aligned;
+}
+
+function filterSeriesByDateRange(series, startDate, endDate) {
+  const start = normalizeDateKey(startDate);
+  const end = normalizeDateKey(endDate);
+  return series.filter((point) => {
+    const key = normalizeDateKey(point.date);
+    return key >= start && key <= end;
+  });
+}
+
+function getReferenceSeries(datasets) {
+  return datasets.reduce(
+    (best, dataset) => (dataset.data.length > best.length ? dataset.data : best),
+    datasets[0]?.data || [],
+  );
+}
+
+function drawXAxis(ctx, referenceSeries, pad, plotW, plotH, width, theme) {
+  if (!referenceSeries.length) return;
+  const tickCount = Math.min(5, referenceSeries.length - 1);
+  ctx.strokeStyle = theme.axis;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(pad.left, pad.top + plotH);
+  ctx.lineTo(width - pad.right, pad.top + plotH);
+  ctx.stroke();
+
+  ctx.fillStyle = theme.label;
+  ctx.font = `10px ${theme.font}`;
+  ctx.textAlign = "center";
+  for (let i = 0; i <= tickCount; i += 1) {
+    const index = Math.round((i / tickCount) * (referenceSeries.length - 1));
+    const x = pad.left + (plotW * index) / Math.max(1, referenceSeries.length - 1);
+    ctx.fillText(formatChartDate(referenceSeries[index].date), x, pad.top + plotH + 16);
+  }
+  ctx.textAlign = "left";
+}
+
+function drawLegend(ctx, datasets, theme, y = 8) {
+  let legendX = 46;
+  datasets.forEach((dataset) => {
+    ctx.fillStyle = dataset.color;
+    ctx.beginPath();
+    ctx.arc(legendX + 4, y, 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = theme.label;
+    ctx.font = `11px ${theme.font}`;
+    ctx.fillText(dataset.name, legendX + 12, y + 4);
+    legendX += ctx.measureText(dataset.name).width + 36;
+  });
+}
+
+function getChartTheme() {
+  const style = getComputedStyle(document.documentElement);
+  const pick = (name, fallback) => style.getPropertyValue(name).trim() || fallback;
+  return {
+    bg: pick("--chart-bg", "#faf9f6"),
+    grid: pick("--chart-grid", "#ebe9e4"),
+    axis: pick("--chart-axis", "#c8c5bf"),
+    label: pick("--chart-label", "#9a9893"),
+    empty: pick("--chart-empty", "#a8a6a1"),
+    series: [
+      pick("--series-1", "#9a8260"),
+      pick("--series-2", "#6d8f87"),
+      pick("--series-3", "#8a939c"),
+      pick("--series-4", "#b46a37"),
+      pick("--series-5", "#3b78b5"),
+    ],
+    up: pick("--red", "#c75345"),
+    down: pick("--green", "#2f8f63"),
+    font: pick("--font", "Inter, ui-sans-serif, sans-serif"),
+  };
+}
+
+function hexToRgba(hex, alpha) {
+  const normalized = hex.replace("#", "");
+  const full = normalized.length === 3
+    ? normalized.split("").map((char) => char + char).join("")
+    : normalized;
+  const value = Number.parseInt(full, 16);
+  const r = (value >> 16) & 255;
+  const g = (value >> 8) & 255;
+  const b = value & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
 function drawLineChart(canvas, datasets, options = {}) {
+  const theme = getChartTheme();
   const ctx = canvas.getContext("2d");
   const ratio = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
@@ -198,12 +327,15 @@ function drawLineChart(canvas, datasets, options = {}) {
 
   const width = canvas.width / ratio;
   const height = canvas.height / ratio;
-  const pad = { top: 18, right: 18, bottom: 30, left: 48 };
+  const pad = { top: 22, right: 16, bottom: 42, left: 46 };
   ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = theme.bg;
+  ctx.fillRect(0, 0, width, height);
 
   const all = datasets.flatMap((dataset) => dataset.data).filter((point) => Number.isFinite(point.value));
   if (!all.length) {
-    ctx.fillStyle = "#666158";
+    ctx.fillStyle = theme.empty;
+    ctx.font = `12px ${theme.font}`;
     ctx.fillText("暂无数据", pad.left, height / 2);
     return;
   }
@@ -213,12 +345,15 @@ function drawLineChart(canvas, datasets, options = {}) {
   const span = max - min || 1;
   const plotW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
-  const longest = Math.max(...datasets.map((dataset) => dataset.data.length));
+  const referenceSeries = getReferenceSeries(datasets);
+  const longest = referenceSeries.length;
 
-  ctx.strokeStyle = "#e0d8ca";
+  drawLegend(ctx, datasets, theme);
+
+  ctx.strokeStyle = theme.grid;
   ctx.lineWidth = 1;
-  ctx.font = "12px Segoe UI, Microsoft YaHei, Arial";
-  ctx.fillStyle = "#666158";
+  ctx.font = `11px ${theme.font}`;
+  ctx.fillStyle = theme.label;
   for (let i = 0; i <= 4; i += 1) {
     const y = pad.top + (plotH * i) / 4;
     ctx.beginPath();
@@ -229,6 +364,30 @@ function drawLineChart(canvas, datasets, options = {}) {
     ctx.fillText(options.percentAxis ? `${formatNumber(label, 1)}%` : formatNumber(label, 1), 6, y + 4);
   }
 
+  const shouldFill = options.fill !== false && datasets.length === 1;
+  if (shouldFill) {
+    datasets.forEach((dataset) => {
+      const gradient = ctx.createLinearGradient(0, pad.top, 0, pad.top + plotH);
+      gradient.addColorStop(0, hexToRgba(dataset.color, 0.16));
+      gradient.addColorStop(1, hexToRgba(dataset.color, 0));
+      ctx.beginPath();
+      dataset.data.forEach((point, index) => {
+        const x = pad.left + (plotW * index) / Math.max(1, longest - 1);
+        const y = pad.top + plotH - ((point.value - min) / span) * plotH;
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      const lastX = pad.left + (plotW * (dataset.data.length - 1)) / Math.max(1, longest - 1);
+      ctx.lineTo(lastX, pad.top + plotH);
+      ctx.lineTo(pad.left, pad.top + plotH);
+      ctx.closePath();
+      ctx.fillStyle = gradient;
+      ctx.fill();
+    });
+  }
+
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
   datasets.forEach((dataset) => {
     ctx.beginPath();
     ctx.strokeStyle = dataset.color;
@@ -242,27 +401,164 @@ function drawLineChart(canvas, datasets, options = {}) {
     ctx.stroke();
 
     const tail = dataset.data[dataset.data.length - 1];
-    if (tail) {
+    if (tail && dataset.data.length === longest) {
       const x = pad.left + (plotW * (dataset.data.length - 1)) / Math.max(1, longest - 1);
       const y = pad.top + plotH - ((tail.value - min) / span) * plotH;
+      ctx.fillStyle = theme.bg;
+      ctx.beginPath();
+      ctx.arc(x, y, 4.5, 0, Math.PI * 2);
+      ctx.fill();
       ctx.fillStyle = dataset.color;
       ctx.beginPath();
-      ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+      ctx.arc(x, y, 2.5, 0, Math.PI * 2);
       ctx.fill();
     }
   });
 
-  let legendX = pad.left;
-  datasets.forEach((dataset) => {
-    ctx.fillStyle = dataset.color;
-    ctx.fillRect(legendX, height - 18, 12, 3);
-    ctx.fillStyle = "#4c473f";
-    ctx.fillText(dataset.name, legendX + 18, height - 14);
-    legendX += ctx.measureText(dataset.name).width + 52;
+  drawXAxis(ctx, referenceSeries, pad, plotW, plotH, width, theme);
+}
+
+function percentile(values, p) {
+  const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
+  if (!sorted.length) return NaN;
+  const index = (sorted.length - 1) * p;
+  const lower = Math.floor(index);
+  const upper = Math.ceil(index);
+  if (lower === upper) return sorted[lower];
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * (index - lower);
+}
+
+function drawVolatilityChart(canvas, series, options = {}) {
+  const theme = getChartTheme();
+  const ctx = canvas.getContext("2d");
+  const ratio = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.max(320, rect.width) * ratio;
+  canvas.height = Number(canvas.getAttribute("height")) * ratio;
+  ctx.scale(ratio, ratio);
+
+  const width = canvas.width / ratio;
+  const height = canvas.height / ratio;
+  const pad = { top: 22, right: 18, bottom: 42, left: 48 };
+  const data = series.filter((point) => Number.isFinite(point.value));
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = theme.bg;
+  ctx.fillRect(0, 0, width, height);
+
+  if (!data.length) {
+    ctx.fillStyle = theme.empty;
+    ctx.font = `12px ${theme.font}`;
+    ctx.fillText("暂无数据", pad.left, height / 2);
+    return;
+  }
+
+  const color = options.color || theme.series[1];
+  const values = data.map((point) => point.value);
+  const p25 = percentile(values, 0.25);
+  const p75 = percentile(values, 0.75);
+  const avg = values.reduce((sum, value) => sum + value, 0) / values.length;
+  const latest = data[data.length - 1];
+  const min = Math.min(...values, p25, avg);
+  const max = Math.max(...values, p75, avg);
+  const padding = Math.max(1.5, (max - min) * 0.14);
+  const yMin = Math.max(0, min - padding);
+  const yMax = max + padding;
+  const span = yMax - yMin || 1;
+  const plotW = width - pad.left - pad.right;
+  const plotH = height - pad.top - pad.bottom;
+  const xFor = (index) => pad.left + (plotW * index) / Math.max(1, data.length - 1);
+  const yFor = (value) => pad.top + plotH - ((value - yMin) / span) * plotH;
+
+  ctx.strokeStyle = theme.grid;
+  ctx.lineWidth = 1;
+  ctx.fillStyle = theme.label;
+  ctx.font = `11px ${theme.font}`;
+  for (let i = 0; i <= 4; i += 1) {
+    const value = yMax - (span * i) / 4;
+    const y = yFor(value);
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(width - pad.right, y);
+    ctx.stroke();
+    ctx.fillText(`${formatNumber(value, 1)}%`, 6, y + 4);
+  }
+
+  const bandTop = yFor(p75);
+  const bandBottom = yFor(p25);
+  ctx.fillStyle = hexToRgba(color, 0.08);
+  ctx.fillRect(pad.left, bandTop, plotW, bandBottom - bandTop);
+  ctx.fillStyle = hexToRgba(color, 0.18);
+  ctx.font = `10px ${theme.font}`;
+  ctx.fillText("中枢区间", pad.left + 8, bandTop + 14);
+
+  const avgY = yFor(avg);
+  ctx.save();
+  ctx.setLineDash([5, 5]);
+  ctx.strokeStyle = hexToRgba(color, 0.42);
+  ctx.beginPath();
+  ctx.moveTo(pad.left, avgY);
+  ctx.lineTo(width - pad.right, avgY);
+  ctx.stroke();
+  ctx.restore();
+
+  const gradient = ctx.createLinearGradient(0, pad.top, 0, pad.top + plotH);
+  gradient.addColorStop(0, hexToRgba(color, 0.22));
+  gradient.addColorStop(1, hexToRgba(color, 0));
+  ctx.beginPath();
+  data.forEach((point, index) => {
+    const x = xFor(index);
+    const y = yFor(point.value);
+    if (index === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
   });
+  ctx.lineTo(xFor(data.length - 1), pad.top + plotH);
+  ctx.lineTo(pad.left, pad.top + plotH);
+  ctx.closePath();
+  ctx.fillStyle = gradient;
+  ctx.fill();
+
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2.4;
+  ctx.beginPath();
+  data.forEach((point, index) => {
+    const x = xFor(index);
+    const y = yFor(point.value);
+    if (index === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  const latestX = xFor(data.length - 1);
+  const latestY = yFor(latest.value);
+  ctx.fillStyle = theme.bg;
+  ctx.beginPath();
+  ctx.arc(latestX, latestY, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(latestX, latestY, 3, 0, Math.PI * 2);
+  ctx.fill();
+
+  const label = `${formatNumber(latest.value, 2)}%`;
+  ctx.font = `600 12px ${theme.font}`;
+  const labelW = ctx.measureText(label).width + 18;
+  const boxX = Math.min(width - pad.right - labelW, Math.max(pad.left, latestX - labelW - 10));
+  const boxY = Math.max(pad.top + 4, latestY - 30);
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.roundRect(boxX, boxY, labelW, 24, 6);
+  ctx.fill();
+  ctx.fillStyle = "#fff";
+  ctx.fillText(label, boxX + 9, boxY + 16);
+
+  drawXAxis(ctx, data, pad, plotW, plotH, width, theme);
+  drawLegend(ctx, [{ name: options.name || "波动率", color, data }], theme);
 }
 
 function drawBarChart(canvas, bars) {
+  const theme = getChartTheme();
   const ctx = canvas.getContext("2d");
   const ratio = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
@@ -273,10 +569,12 @@ function drawBarChart(canvas, bars) {
   const height = canvas.height / ratio;
   const pad = { top: 20, right: 20, bottom: 40, left: 44 };
   ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = theme.bg;
+  ctx.fillRect(0, 0, width, height);
 
   const maxAbs = Math.max(1, ...bars.map((bar) => Math.abs(bar.value)));
   const zeroY = pad.top + (height - pad.top - pad.bottom) / 2;
-  ctx.strokeStyle = "#d8d0c2";
+  ctx.strokeStyle = theme.grid;
   ctx.beginPath();
   ctx.moveTo(pad.left, zeroY);
   ctx.lineTo(width - pad.right, zeroY);
@@ -287,10 +585,10 @@ function drawBarChart(canvas, bars) {
     const center = pad.left + ((width - pad.left - pad.right) * (index + 0.5)) / bars.length;
     const h = (Math.abs(bar.value) / maxAbs) * ((height - pad.top - pad.bottom) / 2 - 10);
     const y = bar.value >= 0 ? zeroY - h : zeroY;
-    ctx.fillStyle = bar.value >= 0 ? "#2f8f63" : "#b84c43";
+    ctx.fillStyle = bar.value >= 0 ? theme.up : theme.down;
     ctx.fillRect(center - barW / 2, y, barW, h);
-    ctx.fillStyle = "#4c473f";
-    ctx.font = "12px Segoe UI, Microsoft YaHei, Arial";
+    ctx.fillStyle = theme.label;
+    ctx.font = `11px ${theme.font}`;
     ctx.textAlign = "center";
     ctx.fillText(bar.label, center, height - 17);
     ctx.fillText(formatPct(bar.value), center, bar.value >= 0 ? y - 7 : y + h + 16);
@@ -302,11 +600,13 @@ function renderMetrics() {
   const goldLast = last(state.gold);
   const gvzLast = last(state.gvz);
   const m = state.metrics;
+  const goldDayChange = pctChange(state.gold);
+  const gvz20Change = pctChange(state.gvz, Math.min(20, state.gvz.length - 1));
   const cards = [
-    ["最新金价", `$${formatNumber(goldLast?.value)}`, `${goldLast?.date || "--"}，日变动 ${formatPct(pctChange(state.gold))}`],
-    ["近20日已实现波动率", `${formatNumber(m.rv20)}%`, "作为短期隐含波动率的辅助参照"],
-    ["GVZ指数", formatNumber(gvzLast?.value), state.gvz.length ? `20日变化 ${formatPct(pctChange(state.gvz, Math.min(20, state.gvz.length - 1)))}` : "FRED GVZCLS 暂无数据"],
-    ["20日 / 50日乖离率", `${formatPct(m.bias20)} / ${formatPct(m.bias50)}`, `SMA20 ${formatNumber(m.sma20)}，SMA50 ${formatNumber(m.sma50)}`],
+    ["最新金价", `$${formatNumber(goldLast?.value)}`, `${goldLast?.date || "--"}，日变动 ${formatPctHtml(goldDayChange)}`],
+    ["近20日已实现波动率", `${formatNumber(m.rv20)}%`, "由金价日收益计算的年化已实现波动率"],
+    ["GVZ 隐含波动率指数", formatNumber(gvzLast?.value), state.gvz.length ? `20日变化 ${formatPctHtml(gvz20Change)}` : "FRED GVZCLS 暂无数据"],
+    ["20日 / 50日乖离率", `${formatPctHtml(m.bias20)} / ${formatPctHtml(m.bias50)}`, `SMA20 ${formatNumber(m.sma20)}，SMA50 ${formatNumber(m.sma50)}`],
   ];
   $("metricGrid").innerHTML = cards
     .map(([label, value, note]) => `<article class="metric"><span>${label}</span><strong>${value}</strong><small>${note}</small></article>`)
@@ -316,8 +616,8 @@ function renderMetrics() {
 function renderReadout() {
   const m = state.metrics;
   const items = [
-    ["3年涨跌幅", formatPct(pctChange(state.gold, state.gold.length - 1))],
-    ["20日涨跌幅", formatPct(pctChange(state.gold, Math.min(20, state.gold.length - 1)))],
+    ["3年涨跌幅", formatPctHtml(pctChange(state.gold, state.gold.length - 1))],
+    ["20日涨跌幅", formatPctHtml(pctChange(state.gold, Math.min(20, state.gold.length - 1)))],
     ["金铜比", formatNumber(last(m.goldCopper)?.value, 2)],
     ["金银比", formatNumber(last(m.goldSilver)?.value, 2)],
     ["广义贸易加权美元指数", formatNumber(state.macro.DTWEXBGS?.value, 2)],
@@ -331,7 +631,7 @@ function scoreSignal() {
   const macro = state.macro;
   const factors = [
     { name: "趋势", value: clamp((m.bias20 + m.bias50) / 12, -1, 1), note: "乖离率" },
-    { name: "波动", value: clamp((24 - (last(state.gvz)?.value || m.rv20)) / 18, -1, 1), note: "GVZ/已实现波动" },
+    { name: "波动", value: clamp((24 - (last(state.gvz)?.value || m.rv20)) / 18, -1, 1), note: "GVZ 隐含波动率" },
     { name: "实际利率", value: clamp(-(macro.DFII10?.change ?? 0) / 0.35, -1, 1), note: "近期变化" },
     { name: "通胀", value: clamp(((macro.CPIAUCSL?.value ?? 2.5) - 2.2) / 2, -1, 1), note: "CPI同比" },
     { name: "美元", value: clamp(-(macro.DTWEXBGS?.change ?? 0) / 2.5, -1, 1), note: "广义贸易加权美元指数变化" },
@@ -347,15 +647,11 @@ function scoreSignal() {
   return { score, label, factors };
 }
 
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, Number.isFinite(value) ? value : 0));
-}
-
 function renderSignal() {
   const signal = scoreSignal();
   const deg = Math.round(signal.score * 3.6);
   $("signalRing").textContent = signal.score;
-  $("signalRing").style.background = `conic-gradient(var(--gold) ${deg}deg, var(--line) ${deg}deg)`;
+  $("signalRing").style.background = `conic-gradient(var(--accent) ${deg}deg, var(--line) ${deg}deg)`;
   $("signalLabel").textContent = signal.label;
   $("signalText").textContent = "基于趋势、波动、利率、通胀、美元与就业的本地评分";
   $("scoreLines").innerHTML = signal.factors
@@ -379,15 +675,14 @@ function renderMacro() {
 }
 
 function renderCharts() {
-  drawLineChart($("goldChart"), [{ name: "Gold Futures", color: "#c89422", data: state.gold }]);
-  drawLineChart($("volChart"), [
-    { name: "GVZ", color: "#386ea8", data: state.gvz.slice(-20) },
-    { name: "20日已实现波动率", color: "#c89422", data: state.metrics.rvPath.slice(-20) },
-  ], { percentAxis: false });
+  const [gold, vol, gvz, ratioA, ratioB] = getChartTheme().series;
+  drawLineChart($("goldChart"), [{ name: "金价", color: gold, data: state.gold }]);
+  drawVolatilityChart($("rvChart"), state.metrics.rvPath, { name: "20日已实现波动率", color: vol });
+  drawVolatilityChart($("gvzChart"), state.gvz, { name: "GVZ 隐含波动率", color: gvz });
   drawLineChart($("ratioChart"), [
-    { name: "金铜比", color: "#a7653e", data: normalize(state.metrics.goldCopper) },
-    { name: "金银比", color: "#386ea8", data: normalize(state.metrics.goldSilver) },
-  ]);
+    { name: "金铜比", color: ratioA, data: normalize(state.metrics.goldCopper) },
+    { name: "金银比", color: ratioB, data: normalize(state.metrics.goldSilver) },
+  ], { fill: false });
 }
 
 function calculateMetrics() {
@@ -427,7 +722,11 @@ async function loadAll() {
     state.gold = gold.value.series;
     state.silver = silver.value.series;
     state.copper = copper.value.series;
-    state.gvz = gvzResult.status === "fulfilled" ? gvzResult.value.slice(-state.gold.length) : [];
+    const gvzRaw = gvzResult.status === "fulfilled" ? gvzResult.value : [];
+    state.gvz = alignSeriesByDates(state.gold, gvzRaw);
+    if (state.gvz.length < 30 && gvzRaw.length) {
+      state.gvz = filterSeriesByDateRange(gvzRaw, state.gold[0]?.date, last(state.gold)?.date);
+    }
     $("goldSource").textContent = gold.value.symbol;
 
     const macroResults = await Promise.allSettled(macroSeries.map(async (item) => {
